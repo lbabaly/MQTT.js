@@ -12,6 +12,7 @@ var Store = require('./../lib/store')
 var port = 9876
 
 module.exports = function (server, config) {
+  var version = config.protocolVersion || 4
   function connect (opts) {
     opts = xtend(config, opts)
     return mqtt.connect(opts)
@@ -73,6 +74,45 @@ module.exports = function (server, config) {
       })
     })
 
+    it('should emit end after end called and client must be disconnected', function (done) {
+      var client = connect()
+
+      client.once('end', function () {
+        if (client.disconnected) {
+          return done()
+        }
+        done(new Error('client must be disconnected'))
+      })
+
+      client.once('connect', function () {
+        client.end()
+      })
+    })
+
+    it('should pass store close error to end callback but not to end listeners', function (done) {
+      var store = new Store()
+      var client = connect({outgoingStore: store})
+
+      store.close = function (cb) {
+        cb(new Error('test'))
+      }
+      client.once('end', function () {
+        if (arguments.length === 0) {
+          return done()
+        }
+        throw new Error('no argument shoould be passed to event')
+      })
+
+      client.once('connect', function () {
+        client.end(function (test) {
+          if (test && test.message === 'test') {
+            return
+          }
+          throw new Error('bad argument passed to callback')
+        })
+      })
+    })
+
     it('should return `this` if end called twice', function (done) {
       var client = connect()
 
@@ -87,6 +127,21 @@ module.exports = function (server, config) {
       })
     })
 
+    it('should emit end only on first client end', function (done) {
+      var client = connect()
+
+      client.once('end', function () {
+        var timeout = setTimeout(done.bind(null), 200)
+        client.once('end', function () {
+          clearTimeout(timeout)
+          done(new Error('end was emitted twice'))
+        })
+        client.end()
+      })
+
+      client.once('connect', client.end.bind(client))
+    })
+
     it('should stop ping timer after end called', function (done) {
       var client = connect()
 
@@ -96,6 +151,50 @@ module.exports = function (server, config) {
         should.not.exist(client.pingTimer)
         done()
       })
+    })
+
+    it('should be able to end even on a failed connection', function (done) {
+      var client = connect({host: 'this_hostname_should_not_exist'})
+
+      var timeout = setTimeout(function () {
+        done(new Error('Failed to end a disconnected client'))
+      }, 500)
+
+      setTimeout(function () {
+        client.end(function () {
+          clearTimeout(timeout)
+          done()
+        })
+      }, 200)
+    })
+
+    it('should emit end even on a failed connection', function (done) {
+      var client = connect({host: 'this_hostname_should_not_exist'})
+
+      var timeout = setTimeout(function () {
+        done(new Error('Disconnected client has failed to emit end'))
+      }, 500)
+
+      client.once('end', function () {
+        clearTimeout(timeout)
+        done()
+      })
+
+      setTimeout(client.end.bind(client), 200)
+    })
+
+    it('should emit end only once for a reconnecting client', function (done) {
+      var client = connect({host: 'this_hostname_should_not_exist', connectTimeout: 10, reconnectPeriod: 10})
+
+      client.once('end', function () {
+        var timeout = setTimeout(done.bind(null))
+        client.once('end', function () {
+          clearTimeout(timeout)
+          done(new Error('end emitted twice'))
+        })
+      })
+
+      setTimeout(client.end.bind(client), 300)
     })
   })
 
@@ -204,11 +303,13 @@ module.exports = function (server, config) {
     })
 
     it('should provide connack packet with connect event', function (done) {
+      var connack = version === 5 ? {reasonCode: 0} : {returnCode: 0}
       server.once('client', function (serverClient) {
-        serverClient.connack({returnCode: 0, sessionPresent: true})
-
+        connack.sessionPresent = true
+        serverClient.connack(connack)
         server.once('client', function (serverClient) {
-          serverClient.connack({returnCode: 0, sessionPresent: false})
+          connack.sessionPresent = false
+          serverClient.connack(connack)
         })
       })
 
@@ -241,7 +342,8 @@ module.exports = function (server, config) {
         done(new Error('Should not emit connect'))
       })
       client.once('error', function (error) {
-        should(error.code).be.equal(2) // code for clientID identifer rejected
+        var value = version === 5 ? 128 : 2
+        should(error.code).be.equal(value) // code for clientID identifer rejected
         client.end()
         done()
       })
@@ -431,6 +533,64 @@ module.exports = function (server, config) {
         setTimeout(function () {
           client.end(true, done)
         }, 10)
+      })
+    })
+
+    it('should not interrupt messages', function (done) {
+      var client = null
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var publishCount = 0
+      var server2 = new Server(function (c) {
+        c.on('connect', function () {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          if (packet.qos !== 0) {
+            c.puback({messageId: packet.messageId})
+          }
+          switch (publishCount++) {
+            case 0:
+              packet.payload.toString().should.equal('payload1')
+              break
+            case 1:
+              packet.payload.toString().should.equal('payload2')
+              break
+            case 2:
+              packet.payload.toString().should.equal('payload3')
+              break
+            case 3:
+              packet.payload.toString().should.equal('payload4')
+              server2.close()
+              done()
+              break
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore,
+          queueQoSZero: true
+        })
+        client.on('packetreceive', function (packet) {
+          if (packet.cmd === 'connack') {
+            setImmediate(
+              function () {
+                client.publish('test', 'payload3', {qos: 1})
+                client.publish('test', 'payload4', {qos: 0})
+              }
+            )
+          }
+        })
+        client.publish('test', 'payload1', {qos: 2})
+        client.publish('test', 'payload2', {qos: 2})
       })
     })
 
@@ -875,6 +1035,115 @@ module.exports = function (server, config) {
       }
     })
 
+    it('should handle error with async incoming store in QoS 2 `handlePublish` method', function (done) {
+      function AsyncStore () {
+        if (!(this instanceof AsyncStore)) {
+          return new AsyncStore()
+        }
+      }
+      AsyncStore.prototype.put = function (packet, cb) {
+        process.nextTick(function () {
+          cb(new Error('Error'))
+        })
+      }
+      var store = new AsyncStore()
+      var client = connect({incomingStore: store})
+
+      client._handlePublish({
+        messageId: 1,
+        topic: 'test',
+        payload: 'test',
+        qos: 2
+      }, function () {
+        done()
+        client.end()
+      })
+    })
+
+    it('should handle error with async incoming store in QoS 2 `handlePubrel` method', function (done) {
+      function AsyncStore () {
+        if (!(this instanceof AsyncStore)) {
+          return new AsyncStore()
+        }
+      }
+      AsyncStore.prototype.del = function (packet, cb) {
+        process.nextTick(function () {
+          cb(new Error('Error'))
+        })
+      }
+      AsyncStore.prototype.get = function (packet, cb) {
+        process.nextTick(function () {
+          cb(null, {cmd: 'publish'})
+        })
+      }
+      var store = new AsyncStore()
+      var client = connect({incomingStore: store})
+
+      client._handlePubrel({
+        messageId: 1,
+        qos: 2
+      }, function () {
+        done()
+        client.end()
+      })
+    })
+
+    it('should handle success with async incoming store in QoS 2 `handlePubrel` method', function (done) {
+      var delComplete = false
+      function AsyncStore () {
+        if (!(this instanceof AsyncStore)) {
+          return new AsyncStore()
+        }
+      }
+      AsyncStore.prototype.del = function (packet, cb) {
+        process.nextTick(function () {
+          delComplete = true
+          cb(null)
+        })
+      }
+      AsyncStore.prototype.get = function (packet, cb) {
+        process.nextTick(function () {
+          cb(null, {cmd: 'publish'})
+        })
+      }
+      var store = new AsyncStore()
+      var client = connect({incomingStore: store})
+
+      client._handlePubrel({
+        messageId: 1,
+        qos: 2
+      }, function () {
+        delComplete.should.equal(true)
+        done()
+        client.end()
+      })
+    })
+
+    it('should handle error with async incoming store in QoS 1 `handlePublish` method', function (done) {
+      function AsyncStore () {
+        if (!(this instanceof AsyncStore)) {
+          return new AsyncStore()
+        }
+      }
+      AsyncStore.prototype.put = function (packet, cb) {
+        process.nextTick(function () {
+          cb(null, 'Error')
+        })
+      }
+      var store = new AsyncStore()
+      var client = connect({incomingStore: store})
+
+      client._handlePublish({
+        messageId: 1,
+        topic: 'test',
+        payload: 'test',
+        qos: 1
+      }, function () {
+        done()
+        client.end()
+      })
+    })
+
     it('should not send a `pubcomp` if the execution of `handleMessage` fails for messages with QoS `2`', function (done) {
       var store = new Store()
       var client = connect({incomingStore: store})
@@ -945,6 +1214,115 @@ module.exports = function (server, config) {
           }
         })
       })
+    })
+
+    it('should keep message order', function (done) {
+      var publishCount = 0
+      var reconnect = false
+      var client = {}
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var server2 = new Server(function (c) {
+        // errors are not interesting for this test
+        // but they might happen on some platforms
+        c.on('error', function () {})
+
+        c.on('connect', function (packet) {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          c.puback({messageId: packet.messageId})
+          if (reconnect) {
+            switch (publishCount++) {
+              case 0:
+                packet.payload.toString().should.equal('payload1')
+                break
+              case 1:
+                packet.payload.toString().should.equal('payload2')
+                break
+              case 2:
+                packet.payload.toString().should.equal('payload3')
+                server2.close()
+                done()
+                break
+            }
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore
+        })
+
+        client.on('connect', function () {
+          if (!reconnect) {
+            client.publish('topic', 'payload1', {qos: 1})
+            client.publish('topic', 'payload2', {qos: 1})
+            client.end(true)
+          } else {
+            client.publish('topic', 'payload3', {qos: 1})
+          }
+        })
+        client.on('close', function () {
+          if (!reconnect) {
+            client.reconnect({
+              clean: false,
+              incomingStore: incomingStore,
+              outgoingStore: outgoingStore
+            })
+            reconnect = true
+          }
+        })
+      })
+    })
+
+    function testCallbackStorePutByQoS (qos, clean, expected, done) {
+      var client = connect({
+        clean: clean,
+        clientId: 'testId'
+      })
+
+      var callbacks = []
+
+      function cbStorePut () {
+        callbacks.push('storeput')
+      }
+
+      client.on('connect', function () {
+        client.publish('test', 'test', {qos: qos, cbStorePut: cbStorePut}, function (err) {
+          if (err) done(err)
+          callbacks.push('publish')
+          should.deepEqual(callbacks, expected)
+          done()
+        })
+        client.end()
+      })
+    }
+
+    it('should not call cbStorePut when publishing message with QoS `0` and clean `true`', function (done) {
+      testCallbackStorePutByQoS(0, true, ['publish'], done)
+    })
+    it('should not call cbStorePut when publishing message with QoS `0` and clean `false`', function (done) {
+      testCallbackStorePutByQoS(0, false, ['publish'], done)
+    })
+    it('should call cbStorePut before publish completes when publishing message with QoS `1` and clean `true`', function (done) {
+      testCallbackStorePutByQoS(1, true, ['storeput', 'publish'], done)
+    })
+    it('should call cbStorePut before publish completes when publishing message with QoS `1` and clean `false`', function (done) {
+      testCallbackStorePutByQoS(1, false, ['storeput', 'publish'], done)
+    })
+    it('should call cbStorePut before publish completes when publishing message with QoS `2` and clean `true`', function (done) {
+      testCallbackStorePutByQoS(2, true, ['storeput', 'publish'], done)
+    })
+    it('should call cbStorePut before publish completes when publishing message with QoS `2` and clean `false`', function (done) {
+      testCallbackStorePutByQoS(2, false, ['storeput', 'publish'], done)
     })
   })
 
@@ -1221,10 +1599,16 @@ module.exports = function (server, config) {
 
       server.once('client', function (serverClient) {
         serverClient.once('subscribe', function (packet) {
-          packet.subscriptions.should.containEql({
+          var result = {
             topic: topic,
             qos: 0
-          })
+          }
+          if (version === 5) {
+            result.nl = false
+            result.rap = false
+            result.rh = 0
+          }
+          packet.subscriptions.should.containEql(result)
           done()
         })
       })
@@ -1272,7 +1656,13 @@ module.exports = function (server, config) {
         serverClient.once('subscribe', function (packet) {
           // i.e. [{topic: 'a', qos: 0}, {topic: 'b', qos: 0}]
           var expected = subs.map(function (i) {
-            return {topic: i, qos: 0}
+            var result = {topic: i, qos: 0}
+            if (version === 5) {
+              result.nl = false
+              result.rap = false
+              result.rh = 0
+            }
+            return result
           })
 
           packet.subscriptions.should.eql(expected)
@@ -1284,8 +1674,8 @@ module.exports = function (server, config) {
     it('should accept an hash of subscriptions', function (done) {
       var client = connect()
       var topics = {
-        test1: 0,
-        test2: 1
+        test1: {qos: 0},
+        test2: {qos: 1}
       }
 
       client.once('connect', function () {
@@ -1299,10 +1689,16 @@ module.exports = function (server, config) {
 
           for (k in topics) {
             if (topics.hasOwnProperty(k)) {
-              expected.push({
+              var result = {
                 topic: k,
-                qos: topics[k]
-              })
+                qos: topics[k].qos
+              }
+              if (version === 5) {
+                result.nl = false
+                result.rap = false
+                result.rh = 0
+              }
+              expected.push(result)
             }
           }
 
@@ -1328,6 +1724,12 @@ module.exports = function (server, config) {
             qos: 1
           }]
 
+          if (version === 5) {
+            expected[0].nl = false
+            expected[0].rap = false
+            expected[0].rh = 0
+          }
+
           packet.subscriptions.should.eql(expected)
           done()
         })
@@ -1345,10 +1747,16 @@ module.exports = function (server, config) {
 
       server.once('client', function (serverClient) {
         serverClient.once('subscribe', function (packet) {
-          packet.subscriptions.should.containEql({
+          var result = {
             topic: topic,
             qos: defaultOpts.qos
-          })
+          }
+          if (version === 5) {
+            result.nl = false
+            result.rap = false
+            result.rh = 0
+          }
+          packet.subscriptions.should.containEql(result)
           done()
         })
       })
@@ -1364,7 +1772,13 @@ module.exports = function (server, config) {
             done(err)
           } else {
             should.exist(granted, 'granted not given')
-            granted.should.containEql({topic: 'test', qos: 2})
+            var result = {topic: 'test', qos: 2}
+            if (version === 5) {
+              result.nl = false
+              result.rap = false
+              result.rh = 0
+            }
+            granted.should.containEql(result)
             done()
           }
         })
@@ -1410,10 +1824,16 @@ module.exports = function (server, config) {
 
       server.once('client', function (serverClient) {
         serverClient.once('subscribe', function (packet) {
-          packet.subscriptions.should.containEql({
+          var result = {
             topic: topic,
             qos: 0
-          })
+          }
+          if (version === 5) {
+            result.nl = false
+            result.rap = false
+            result.rh = 0
+          }
+          packet.subscriptions.should.containEql(result)
           done()
         })
       })
@@ -1640,9 +2060,76 @@ module.exports = function (server, config) {
       var testTopic = 'test'
       var testMessage = 'message'
       var mid = 253
+      var publishReceived = false
+      var pubrecReceived = false
+      var pubrelReceived = false
 
       client.once('connect', function () {
         client.subscribe(testTopic, {qos: 2})
+      })
+
+      client.on('packetreceive', (packet) => {
+        switch (packet.cmd) {
+          case 'connack':
+          case 'suback':
+            // expected, but not specifically part of QOS 2 semantics
+            break
+          case 'publish':
+            pubrecReceived.should.be.false()
+            pubrelReceived.should.be.false()
+            publishReceived = true
+            break
+          case 'pubrel':
+            publishReceived.should.be.true()
+            pubrecReceived.should.be.true()
+            pubrelReceived = true
+            break
+          default:
+            should.fail()
+        }
+      })
+
+      server.once('client', function (serverClient) {
+        serverClient.once('subscribe', function () {
+          serverClient.publish({
+            topic: testTopic,
+            payload: testMessage,
+            qos: 2,
+            messageId: mid
+          })
+        })
+
+        serverClient.on('pubrec', function () {
+          publishReceived.should.be.true()
+          pubrelReceived.should.be.false()
+          pubrecReceived = true
+        })
+
+        serverClient.once('pubcomp', function () {
+          client.removeAllListeners()
+          serverClient.removeAllListeners()
+          publishReceived.should.be.true()
+          pubrecReceived.should.be.true()
+          pubrelReceived.should.be.true()
+          done()
+        })
+      })
+    })
+
+    it('should should empty the incoming store after a qos 2 handshake is completed', function (done) {
+      var client = connect()
+      var testTopic = 'test'
+      var testMessage = 'message'
+      var mid = 253
+
+      client.once('connect', function () {
+        client.subscribe(testTopic, {qos: 2})
+      })
+
+      client.on('packetreceive', (packet) => {
+        if (packet.cmd === 'pubrel') {
+          should(client.incomingStore._inflights.size).be.equal(1)
+        }
       })
 
       server.once('client', function (serverClient) {
@@ -1656,9 +2143,93 @@ module.exports = function (server, config) {
         })
 
         serverClient.once('pubcomp', function () {
+          should(client.incomingStore._inflights.size).be.equal(0)
+          client.removeAllListeners()
           done()
         })
       })
+    })
+
+    function testMultiplePubrel (shouldSendPubcompFail, done) {
+      var client = connect()
+      var testTopic = 'test'
+      var testMessage = 'message'
+      var mid = 253
+      var pubcompCount = 0
+      var pubrelCount = 0
+      var handleMessageCount = 0
+      var emitMessageCount = 0
+      var origSendPacket = client._sendPacket
+      var shouldSendFail
+
+      client.handleMessage = function (packet, callback) {
+        handleMessageCount++
+        callback()
+      }
+
+      client.on('message', function () {
+        emitMessageCount++
+      })
+
+      client._sendPacket = function (packet, sendDone) {
+        shouldSendFail = packet.cmd === 'pubcomp' && shouldSendPubcompFail
+        if (sendDone) {
+          sendDone(shouldSendFail ? new Error('testing pubcomp failure') : undefined)
+        }
+
+        // send the mocked response
+        switch (packet.cmd) {
+          case 'subscribe':
+            const suback = {cmd: 'suback', messageId: packet.messageId, granted: [2]}
+            client._handlePacket(suback, function (err) {
+              should(err).not.be.ok()
+            })
+            break
+          case 'pubrec':
+          case 'pubcomp':
+            // for both pubrec and pubcomp, reply with pubrel, simulating the server not receiving the pubcomp
+            if (packet.cmd === 'pubcomp') {
+              pubcompCount++
+              if (pubcompCount === 2) {
+                // end the test once the client has gone through two rounds of replying to pubrel messages
+                pubrelCount.should.be.exactly(2)
+                handleMessageCount.should.be.exactly(1)
+                emitMessageCount.should.be.exactly(1)
+                client._sendPacket = origSendPacket
+                done()
+                break
+              }
+            }
+
+            // simulate the pubrel message, either in response to pubrec or to mock pubcomp failing to be received
+            const pubrel = {cmd: 'pubrel', messageId: mid}
+            pubrelCount++
+            client._handlePacket(pubrel, function (err) {
+              if (shouldSendFail) {
+                should(err).be.ok()
+              } else {
+                should(err).not.be.ok()
+              }
+            })
+            break
+        }
+      }
+
+      client.once('connect', function () {
+        client.subscribe(testTopic, {qos: 2})
+        const publish = {cmd: 'publish', topic: testTopic, payload: testMessage, qos: 2, messageId: mid}
+        client._handlePacket(publish, function (err) {
+          should(err).not.be.ok()
+        })
+      })
+    }
+
+    it('handle qos 2 messages exactly once when multiple pubrel received', function (done) {
+      testMultiplePubrel(false, done)
+    })
+
+    it('handle qos 2 messages exactly once when multiple pubrel received and sending pubcomp fails on client', function (done) {
+      testMultiplePubrel(true, done)
     })
   })
 
@@ -1775,6 +2346,11 @@ module.exports = function (server, config) {
       })
     })
 
+    it('should always cleanup successfully on reconnection', function (done) {
+      var client = connect({host: 'this_hostname_should_not_exist', connectTimeout: 0, reconnectPeriod: 1})
+      setTimeout(client.end.bind(client, done), 50)
+    })
+
     it('should resend in-flight QoS 1 publish messages from the client', function (done) {
       var client = connect({reconnectPeriod: 200})
       var serverPublished = false
@@ -1806,6 +2382,31 @@ module.exports = function (server, config) {
           done()
         }
       }
+    })
+
+    it('should not resend in-flight publish messages if disconnecting', function (done) {
+      var client = connect({reconnectPeriod: 200})
+      var serverPublished = false
+      var clientCalledBack = false
+      server.once('client', function (serverClient) {
+        serverClient.on('connect', function () {
+          setImmediate(function () {
+            serverClient.stream.destroy()
+            client.end()
+            serverPublished.should.be.false()
+            clientCalledBack.should.be.false()
+            done()
+          })
+        })
+        server.once('client', function (serverClientNew) {
+          serverClientNew.on('publish', function () {
+            serverPublished = true
+          })
+        })
+      })
+      client.publish('hello', 'world', { qos: 1 }, function () {
+        clientCalledBack = true
+      })
     })
 
     it('should resend in-flight QoS 2 publish messages from the client', function (done) {
@@ -1867,10 +2468,10 @@ module.exports = function (server, config) {
         should(err.message).be.equal('Message removed')
       })
       should(Object.keys(client.outgoing).length).be.equal(1)
-      should(Object.keys(client.outgoingStore._inflights).length).be.equal(1)
+      should(client.outgoingStore._inflights.size).be.equal(1)
       client.removeOutgoingMessage(client.getLastMessageId())
       should(Object.keys(client.outgoing).length).be.equal(0)
-      should(Object.keys(client.outgoingStore._inflights).length).be.equal(0)
+      should(client.outgoingStore._inflights.size).be.equal(0)
       clientCalledBack.should.be.true()
       client.end()
       done()
@@ -1900,10 +2501,10 @@ module.exports = function (server, config) {
         should(err.message).be.equal('Message removed')
       })
       should(Object.keys(client.outgoing).length).be.equal(1)
-      should(Object.keys(client.outgoingStore._inflights).length).be.equal(1)
+      should(client.outgoingStore._inflights.size).be.equal(1)
       client.removeOutgoingMessage(client.getLastMessageId())
       should(Object.keys(client.outgoing).length).be.equal(0)
-      should(Object.keys(client.outgoingStore._inflights).length).be.equal(0)
+      should(client.outgoingStore._inflights.size).be.equal(0)
       clientCalledBack.should.be.true()
       client.end()
       done()
@@ -2080,6 +2681,216 @@ module.exports = function (server, config) {
       })
     })
 
+    it('should resend in-flight QoS 1 publish messages from the client if clean is false', function (done) {
+      var reconnect = false
+      var client = {}
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var server2 = new Server(function (c) {
+        c.on('connect', function (packet) {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          if (reconnect) {
+            server2.close()
+            done()
+          } else {
+            client.end(true, function () {
+              client.reconnect({
+                incomingStore: incomingStore,
+                outgoingStore: outgoingStore
+              })
+              reconnect = true
+            })
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore
+        })
+
+        client.on('connect', function () {
+          if (!reconnect) {
+            client.publish('topic', 'payload', {qos: 1})
+          }
+        })
+        client.on('error', function () {})
+      })
+    })
+
+    it('should resend in-flight QoS 2 publish messages from the client if clean is false', function (done) {
+      var reconnect = false
+      var client = {}
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var server2 = new Server(function (c) {
+        c.on('connect', function (packet) {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          if (reconnect) {
+            server2.close()
+            done()
+          } else {
+            client.end(true, function () {
+              client.reconnect({
+                incomingStore: incomingStore,
+                outgoingStore: outgoingStore
+              })
+              reconnect = true
+            })
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore
+        })
+
+        client.on('connect', function () {
+          if (!reconnect) {
+            client.publish('topic', 'payload', {qos: 2})
+          }
+        })
+        client.on('error', function () {})
+      })
+    })
+
+    it('should resend in-flight QoS 2 pubrel messages from the client if clean is false', function (done) {
+      var reconnect = false
+      var client = {}
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var server2 = new Server(function (c) {
+        c.on('connect', function (packet) {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          if (!reconnect) {
+            c.pubrec({messageId: packet.messageId})
+          }
+        })
+        c.on('pubrel', function () {
+          if (reconnect) {
+            server2.close()
+            done()
+          } else {
+            client.end(true, function () {
+              client.reconnect({
+                incomingStore: incomingStore,
+                outgoingStore: outgoingStore
+              })
+              reconnect = true
+            })
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore
+        })
+
+        client.on('connect', function () {
+          if (!reconnect) {
+            client.publish('topic', 'payload', {qos: 2})
+          }
+        })
+        client.on('error', function () {})
+      })
+    })
+
+    it('should resend in-flight publish messages by published order', function (done) {
+      var publishCount = 0
+      var reconnect = false
+      var disconnectOnce = true
+      var client = {}
+      var incomingStore = new mqtt.Store({ clean: false })
+      var outgoingStore = new mqtt.Store({ clean: false })
+      var server2 = new Server(function (c) {
+        // errors are not interesting for this test
+        // but they might happen on some platforms
+        c.on('error', function () {})
+
+        c.on('connect', function (packet) {
+          c.connack({returnCode: 0})
+        })
+        c.on('publish', function (packet) {
+          c.puback({messageId: packet.messageId})
+          if (reconnect) {
+            switch (publishCount++) {
+              case 0:
+                packet.payload.toString().should.equal('payload1')
+                break
+              case 1:
+                packet.payload.toString().should.equal('payload2')
+                break
+              case 2:
+                packet.payload.toString().should.equal('payload3')
+                server2.close()
+                done()
+                break
+            }
+          } else {
+            if (disconnectOnce) {
+              client.end(true, function () {
+                reconnect = true
+                client.reconnect({
+                  incomingStore: incomingStore,
+                  outgoingStore: outgoingStore
+                })
+              })
+              disconnectOnce = false
+            }
+          }
+        })
+      })
+
+      server2.listen(port + 50, function () {
+        client = mqtt.connect({
+          port: port + 50,
+          host: 'localhost',
+          clean: false,
+          clientId: 'cid1',
+          reconnectPeriod: 0,
+          incomingStore: incomingStore,
+          outgoingStore: outgoingStore
+        })
+
+        client.nextId = 65535
+
+        client.on('connect', function () {
+          if (!reconnect) {
+            client.publish('topic', 'payload1', {qos: 1})
+            client.publish('topic', 'payload2', {qos: 1})
+            client.publish('topic', 'payload3', {qos: 1})
+          }
+        })
+        client.on('error', function () {})
+      })
+    })
+
     it('should be able to pub/sub if reconnect() is called at close handler', function (done) {
       var client = connect({ reconnectPeriod: 0 })
       var tryReconnect = true
@@ -2144,6 +2955,7 @@ module.exports = function (server, config) {
 
     context('with alternate server client', function () {
       var cachedClientListeners
+      var connack = version === 5 ? { reasonCode: 0 } : { returnCode: 0 }
 
       beforeEach(function () {
         cachedClientListeners = server.listeners('client')
@@ -2165,7 +2977,7 @@ module.exports = function (server, config) {
         server.on('client', function (serverClient) {
           serverClient.on('connect', function () {
             connectCount++
-            serverClient.connack({returnCode: 0})
+            serverClient.connack(connack)
           })
 
           serverClient.on('subscribe', function () {
@@ -2194,7 +3006,7 @@ module.exports = function (server, config) {
 
         server.on('client', function (serverClient) {
           serverClient.on('connect', function () {
-            serverClient.connack({returnCode: 0})
+            serverClient.connack(connack)
           })
 
           serverClient.on('subscribe', function () {
